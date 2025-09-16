@@ -64,3 +64,5 @@ def register_model():
 
     ModelRegistry.register_model(
         "Qwen3ForCausalLM", "vllm_ascend.models.qwen3:CustomQwen3ForCausalLM")
+    ModelRegistry.register_model(
+        "Qwen3MoeMamba2ForCausalLM", "vllm_ascend.models.qwen3_moe_mamba2:Qwen3MoeMamba2ForCausalLM")
