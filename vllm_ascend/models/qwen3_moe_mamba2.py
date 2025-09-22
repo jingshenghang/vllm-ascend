@@ -32,14 +32,17 @@ from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.models.qwen3_moe import (
     Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeBlock)
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader, extract_layer_index, is_pp_missing_parameter, 
+    AutoWeightsLoader, extract_layer_index, is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory, make_layers, maybe_prefix)
 from vllm.model_executor.model_loader.weight_utils import (
-    LoaderFunction, composed_weight_loader, 
+    LoaderFunction, composed_weight_loader,
     sharded_weight_loader, default_weight_loader)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
+from vllm_ascend.models.qwen3_moe import AscendQwen3MoeDecoderLayer
+from vllm_ascend.ops.fused_moe import AscendSparseMoeBlock
+
 
 
 
@@ -145,7 +148,7 @@ def unbatch_hidden_states(batched_hidden, seq_lens):
         seq_len = seq_lens[i]
         sequence = batched_hidden[i, :seq_len]
         sequences.append(sequence)
-    
+
     hidden_states = torch.cat(sequences, dim=0)
 
     return hidden_states
@@ -156,7 +159,7 @@ def batch_hidden_states(hidden_states, seq_lens):
     Args:
         batched_hidden: [seqlen, dim]
         seq_lens: [s1, s2, ..., s_batch]
-    
+
     Returns:
         hidden_states: [batch, max(seq_lens), dim]
     """
@@ -165,7 +168,7 @@ def batch_hidden_states(hidden_states, seq_lens):
     for seq_len in seq_lens:
         sequences.append(hidden_states[start_idx:start_idx + seq_len])
         start_idx += seq_len
-    
+
     # 对序列进行padding
     padded_sequences = pad_sequence(sequences, batch_first=True, padding_value=0)
 
@@ -179,7 +182,7 @@ def pad_for_causal_conv(x, lengths, width):
     for i in range(batch):
         L_i = lengths[i]
         pad_length = max(width - 1 - L_i, 0)
-        
+
         if L_i >= width - 1:
             # 截断最后 width - 1 个状态
             padded = x[i, :, - (width - 1):]  # [dim, width - 1]
@@ -443,7 +446,7 @@ class MambaCacheManager:
     def __init__(self, vllm_config: VllmConfig, dtype: torch.dtype,
                  num_mamba_layers: int, conv_state_shape: tuple[int, int],
                  temporal_state_shape: tuple[int, int]):
-        
+
         max_batch_size = vllm_config.scheduler_config.max_num_seqs
 
         self.cache_indices_mapping: dict[str, dict[int, int]] = {}
@@ -459,11 +462,11 @@ class MambaCacheManager:
                                      device="npu")
 
         self._mamba_cache = (conv_state, temporal_state)
-    
+
     @property
     def cache(self):
         return self._mamba_cache
-    
+
     def current_run_tensors(self, **kwargs) -> MambaCacheParams:
         """
         Return the tensors for the current run's conv and ssm state.
@@ -485,10 +488,10 @@ class MambaCacheManager:
             # CUDA graph capturing runs
             cache_tensors, state_indices_tensor = kwargs[
                 "seqlen_agnostic_capture_inputs"]
-        
+
         return MambaCacheParams(cache_tensors[0], cache_tensors[1],
                                 state_indices_tensor)
-    
+
     def _copy_cache(self, from_index: int, to_index: int):
         for cache_t in self.cache:
             cache_t[:, to_index].copy_(cache_t[:, from_index],
@@ -531,7 +534,7 @@ class MambaCacheManager:
             for req_id, seq_ids in request_ids_to_seq_ids.items()
             for seq_id in seq_ids
         ]
-    
+
     def _release_finished_requests(self,
                                    finished_seq_groups_req_ids: list[str]):
         for req_id in finished_seq_groups_req_ids:
@@ -585,6 +588,7 @@ class Mixer2RMSNormGated(nn.Module):
         #      the input and then redundantly compute the RMSNorm.
         input_dtype = x.dtype
         x = x * nn.functional.silu(gate.to(torch.float32))
+        # x = x.to(torch.float32) * nn.functional.silu(gate.to(torch.float32))
         if not self.use_rms_norm:
             return x.to(input_dtype)
 
@@ -611,7 +615,8 @@ class Mixer2RMSNormGated(nn.Module):
             x_grouped = x.view(*prefix_dims, group_count, self.group_size)
             variance = x_grouped.pow(2).mean(-1, keepdim=True)
             x_grouped = x_grouped * torch.rsqrt(variance +
-                                                self.variance_epsilon)
+                                           self.variance_epsilon)
+                                           
             x = x_grouped.view(*prefix_dims, hidden_dim)
 
             if redundant_tp:
@@ -794,7 +799,6 @@ class MambaMixer2Hybrid(nn.Module):
 
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
-
         gate, hidden_states_B_C, dt = torch.split(
             projected_states,
             [
@@ -926,7 +930,7 @@ class Mamba2DecoderLayer(nn.Module):
 
         if config.d_inner is None:
             config.d_inner = config.expand * config.d_model
-        
+
         self.mamba = MambaMixer2Hybrid(hidden_size=config.d_model,
                                        xb_size=config.d_xb,
                                        ssm_state_size=config.d_state,
@@ -936,11 +940,11 @@ class Mamba2DecoderLayer(nn.Module):
                                        use_bias=config.use_bias,
                                        n_groups=config.ngroups,
                                        quant_config=quant_config)
-        
-        self.mlp = Qwen3MoeSparseMoeBlock(config=config,
+
+        self.mlp = AscendSparseMoeBlock(config=config, # Qwen3MoeSparseMoeBlock
                                           quant_config=quant_config,
                                           prefix=f"{prefix}.mlp")
-        
+
         self.input_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
 
@@ -955,12 +959,11 @@ class Mamba2DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual) # inside norm hidden_states + residual
 
         hidden_states = self.mamba(hidden_states,mamba_cache_params, mamba2_metadata)
-
         hidden_states = hidden_states + residual
-        
+
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -990,7 +993,7 @@ class Qwen3MoeMamba2Model(nn.Module):
         def get_layer(prefix):
             idx = extract_layer_index(prefix)
             if idx in mamba_config.attn_layers:
-                return Qwen3MoeDecoderLayer(config=config,
+                return AscendQwen3MoeDecoderLayer(config=config, # AscendQwen3MoeDecoderLayer
                                             cache_config=cache_config,
                                             quant_config=quant_config,
                                             prefix=prefix)
@@ -1030,7 +1033,7 @@ class Qwen3MoeMamba2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        
+
         attn_metadata = get_forward_context().attn_metadata
         
         mamba2_metadata = None
@@ -1042,7 +1045,7 @@ class Qwen3MoeMamba2Model(nn.Module):
         mamba_index = 0
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            if isinstance(layer, Qwen3MoeDecoderLayer):
+            if isinstance(layer, AscendQwen3MoeDecoderLayer):
                 hidden_states, residual = layer(
                     positions=positions, 
                     hidden_states=hidden_states, 
@@ -1189,7 +1192,7 @@ class Qwen3MoeMamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP, 
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-                
+
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = quant_config
@@ -1197,7 +1200,7 @@ class Qwen3MoeMamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP, 
         self.mamba_config = MambaConfig(**config.mamba_config)
         assert not vllm_config.cache_config.enable_prefix_caching, \
             "Mamba does not support prefix caching"
-        
+
         self.model = Qwen3MoeMamba2Model(vllm_config=vllm_config,
                                    prefix=maybe_prefix(prefix, "model"))
         self.lm_head = ParallelLMHead(config.vocab_size,
@@ -1223,7 +1226,6 @@ class Qwen3MoeMamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP, 
     ) -> Union[torch.Tensor, IntermediateTensors]:
 
         if self.mamba_cache is None:
-
             num_mamba_layers = self.model_config.get_num_layers_by_block_type(
                 self.vllm_config.parallel_config, LayerBlockType.mamba)
 
