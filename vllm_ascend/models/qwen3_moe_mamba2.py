@@ -22,7 +22,8 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear, RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.mamba2_metadata import Mamba2Metadata
+from vllm.model_executor.layers.mamba.mamba2_metadata import (
+    Mamba2Metadata, prepare_mamba2_metadata)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
@@ -43,6 +44,14 @@ from vllm.sequence import IntermediateTensors
 from vllm_ascend.models.qwen3_moe import AscendQwen3MoeDecoderLayer
 from vllm_ascend.ops.fused_moe import AscendSparseMoeBlock
 
+from vllm_ascend.models.qwen3_moe import save_tensor_sequentially
+from vllm.distributed import (
+            divide, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank,
+            tensor_model_parallel_all_gather, tensor_model_parallel_all_reduce)
+from vllm.model_executor.layers.mamba.ops.ssd_combined import (
+    mamba_chunk_scan_combined)
+from vllm_ascend.models.qwen3_moe import create_stop_flag
+import torch_npu
 
 
 
@@ -233,7 +242,7 @@ def causal_conv1d_update(x, conv_state, weight, bias=None, activation=None, cach
     out = F.conv1d(x_new, weight.unsqueeze(1), bias, padding=0, groups=dim)[:, :, -seqlen:]
     if unsqueeze:
         out = out.squeeze(-1)
-    return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
+    return (out if activation is None else F.silu(out)).to(dtype=dtype_in), conv_state
 
 
 def causal_conv1d_fn(
@@ -326,6 +335,8 @@ def chunk_scan(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):
     _, _, ngroups, dstate = B.shape
     assert B.shape == (batch, seqlen, ngroups, dstate)
     _, _, nchunks, chunk_size = dt.shape
+    if seqlen != nchunks * chunk_size:
+        a = 1
     assert seqlen == nchunks * chunk_size
     assert C.shape == B.shape
     B = repeat(B, "b l g d -> b l (g h) d", h=nheads // ngroups)
@@ -617,7 +628,7 @@ class Mixer2RMSNormGated(nn.Module):
             x_grouped = x_grouped * torch.rsqrt(variance +
                                            self.variance_epsilon)
                                            
-            x = x_grouped.view(*prefix_dims, hidden_dim)
+            x = x_grouped.view(*prefix_dims, hidden_dim) # should use split num 
 
             if redundant_tp:
                 start = self.per_rank_hidden_size * self.tp_rank
@@ -626,6 +637,76 @@ class Mixer2RMSNormGated(nn.Module):
 
         return self.weight * x.to(input_dtype)
 
+
+class Mamba2RMSNorm(nn.Module):
+
+    def __init__(self, hidden_size, eps=1e-5, group_size=None, norm_before_gate=True, device=None, dtype=None, sequence_parallel: bool = True):
+        """If group_size is not None, we do GroupNorm with each group having group_size elements.
+        group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
+        """
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.eps = eps
+        # self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.full_hidden_size = hidden_size
+        #self.group_size = full_hidden_size // full_n_groups
+        self.per_rank_hidden_size = self.full_hidden_size // self.tp_size
+
+        self.weight = torch.nn.Parameter(torch.ones(self.per_rank_hidden_size))
+        set_weight_attrs(self.weight, {"weight_loader": sharded_weight_loader(0)})
+
+        self.register_parameter("bias", None)
+        self.group_size = group_size  # do not // 8 , here should be intermediate_size // self.n_groups = 4096 // 32 = 128
+        self.norm_before_gate = norm_before_gate
+        self.reset_parameters()
+
+        setattr(self.weight, 'sequence_parallel', sequence_parallel)
+
+    def reset_parameters(self):
+        torch.nn.init.ones_(self.weight)
+
+    def _rms_norm_ref(self, x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True, upcast=True):
+        dtype = torch.bfloat16
+        N = x.shape[-1]
+        weight = weight.float()
+        bias = bias.float() if bias is not None else None
+        # args = get_args()
+        use_fused_rmsnorm = False # do not use torch_npu!!!!! TODO
+        if upcast:
+            x = x.float()
+            z = z.float() if z is not None else z
+        if z is not None and not norm_before_gate:
+            x = x * nn.functional.silu(z)
+        if group_size is None:
+            if use_fused_rmsnorm:
+                out = torch_npu.npu_rms_norm(x, weight, epsilon=eps)[0]
+            else:
+                rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
+                out = x * rstd * weight
+            out = out + bias if bias is not None else out
+        else:
+            x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
+            if use_fused_rmsnorm:
+                out = torch_npu.npu_rms_norm(x_group, weight.view(-1, group_size), epsilon=eps)[0]
+            else:
+                rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) + eps)
+                out = x_group * rstd * weight.view(-1, group_size)  
+            out = rearrange(out, "... g d -> ... (g d)")
+            if bias is not None:
+                out = out + bias
+        if z is not None and norm_before_gate:
+            out *= nn.functional.silu(z)
+        return out.to(dtype)        
+
+    def forward(self, x, z=None):
+        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))
+        """
+        return self._rms_norm_ref(x, self.weight, self.bias, z=z, eps=self.eps, group_size=self.group_size,
+                            norm_before_gate=self.norm_before_gate)       
 
 
 class MambaMixer2Hybrid(nn.Module):
@@ -780,9 +861,18 @@ class MambaMixer2Hybrid(nn.Module):
                                           input_is_parallel=True,
                                           quant_config=quant_config)
 
-        self.norm = Mixer2RMSNormGated(intermediate_size,
-                                       n_groups,
-                                       eps=rms_norm_eps)
+        # self.norm = Mixer2RMSNormGated(intermediate_size,
+        #                                n_groups,
+        #                                eps=rms_norm_eps)
+        
+        self.norm = Mamba2RMSNorm(
+                intermediate_size,
+                eps=rms_norm_eps,
+                group_size=intermediate_size // self.n_groups,
+                norm_before_gate=False,
+                device=torch_npu.npu.current_device(),
+                dtype=torch.bfloat16,
+            )
 
 
     def forward(
@@ -791,11 +881,18 @@ class MambaMixer2Hybrid(nn.Module):
         mamba_cache_params: MambaCacheParams,
         mamba2_metadata: Mamba2Metadata,
     ):
+        save_tensor_sequentially(hidden_states, "start_mamba", get_tensor_model_parallel_rank())
         # 0. attn_metadata
         attn_metadata = get_forward_context().attn_metadata
         prefill = attn_metadata.num_prefills > 0
         seq_len, _ = hidden_states.shape
         groups_time_state_size = self.n_groups * self.ssm_state_size
+
+        num_prefills = attn_metadata.num_prefills  # request count
+        num_decodes = attn_metadata.num_decode_tokens  # token count (=request)
+        num_prefill_tokens = attn_metadata.num_prefill_tokens  # token count
+        has_prefill = num_prefills > 0
+        has_decode = num_decodes > 0
 
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
@@ -809,6 +906,12 @@ class MambaMixer2Hybrid(nn.Module):
             dim=-1,
         )
 
+        # dt_p, dt_d = torch.split(
+        #     dt,
+        #     [num_prefill_tokens, num_decodes],
+        #     dim=0,
+        # )
+
         # 2. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
                                                self.conv1d.weight.size(2))
@@ -816,18 +919,20 @@ class MambaMixer2Hybrid(nn.Module):
 
         if prefill:
             hidden_states_batched = batch_hidden_states(hidden_states_B_C, attn_metadata.seq_lens)
-            hidden_states_B_C_batched = causal_conv1d_fn(
+            hidden_states_B_C_batched, final_states_out = causal_conv1d_fn(
                 x=hidden_states_batched.transpose(1, 2),
                 weight=conv_weights,
                 bias=self.conv1d.bias,
                 initial_states=None,
                 activation=self.activation,
-                final_states_out=mamba_cache_params.conv_state[mamba_cache_params.state_indices_tensor],
+                final_states_out=None,
+                return_final_states=True,
                 seq_len=attn_metadata.seq_lens
             )
+            mamba_cache_params.conv_state[mamba_cache_params.state_indices_tensor] = final_states_out
             hidden_states_B_C = hidden_states_B_C_batched.transpose(1, 2)
         else:
-            hidden_states_B_C = causal_conv1d_update(
+            hidden_states_B_C, conv_state = causal_conv1d_update(
                 x=hidden_states_B_C,
                 conv_state=mamba_cache_params.conv_state[mamba_cache_params.state_indices_tensor],
                 weight=conv_weights,
@@ -835,6 +940,8 @@ class MambaMixer2Hybrid(nn.Module):
                 activation=self.activation,
                 seq_len=attn_metadata.seq_lens
             )
+
+            mamba_cache_params.conv_state[mamba_cache_params.state_indices_tensor] = conv_state
 
 
         # - get hidden_states, B and C after depthwise convolution.
@@ -847,6 +954,8 @@ class MambaMixer2Hybrid(nn.Module):
             ],
             dim=-1,
         )
+
+        save_tensor_sequentially(hidden_states, "after_conv", get_tensor_model_parallel_rank())
 
         # 3. State Space Model sequence transformation
         if prefill:
@@ -861,6 +970,43 @@ class MambaMixer2Hybrid(nn.Module):
 
             C = rearrange(C, "b l (g n) -> b l g n", g=B.shape[-2])
 
+            flag = False
+
+            if flag:
+                chunk_size = 256
+                initial_states = None
+                if (mamba2_metadata.has_initial_states is not None
+                        and mamba2_metadata.prep_initial_states):
+                    # making a copy of the states
+                    initial_states = torch.where(
+                        mamba2_metadata.has_initial_states[:, None, None, None],
+                        mamba_cache_params.ssm_state[state_indices_tensor_p], 0)
+                scan_output, varlen_state = mamba_chunk_scan_combined(
+                    C.reshape(1, num_prefill_tokens,
+                                         self.num_heads // self.tp_size,
+                                         self.head_dim),
+                    dt.unsqueeze(0),
+                    self.A,
+                    B.reshape(1, num_prefill_tokens, self.n_groups // self.tp_size,
+                             -1),
+                    hidden_states.reshape(1, num_prefill_tokens, self.n_groups // self.tp_size,
+                             -1),
+                    chunk_size=chunk_size, # mamba2_metadata.chunk_size,
+                    D=self.D,
+                    z=None,
+                    dt_bias=self.dt_bias,
+                    seq_idx=mamba2_metadata.seq_idx,
+                    chunk_indices=mamba2_metadata.chunk_indices,
+                    chunk_offsets=mamba2_metadata.chunk_offsets,
+                    cu_seqlens=attn_metadata.query_start_loc[:num_prefills + 1],
+                    initial_states=initial_states,
+                    return_varlen_states=True,
+                    return_final_states=False,
+                    dt_softplus=True,
+                    dt_limit=(0.0, float("inf")),
+                )
+                a = 1
+
             scan_output, states = ssd_chunk_scan_combined(
                 x=hidden_states,
                 dt=batch_hidden_states(dt, attn_metadata.seq_lens),
@@ -870,10 +1016,11 @@ class MambaMixer2Hybrid(nn.Module):
                 D=self.D,
                 z=None,
                 dt_bias=self.dt_bias,
-                dt_softplus=True
+                dt_softplus=True,
+                chunk_size=4096
             )
             # update ssm states
-            mamba_cache_params.ssm_state[mamba_cache_params.state_indices_tensor] = states.squeeze(1)
+            mamba_cache_params.ssm_state[mamba_cache_params.state_indices_tensor] = states
             hidden_states = unbatch_hidden_states(scan_output.to(hidden_states.dtype), attn_metadata.seq_lens)
             hidden_states = hidden_states.view(seq_len, -1)
 
@@ -902,20 +1049,23 @@ class MambaMixer2Hybrid(nn.Module):
             B = repeat(B, "b g n -> b (g h) n", h=nheads // ngroups)  # (batch, nheads, dstate)
             C = repeat(C, "b g n -> b (g h) n", h=nheads // ngroups)  # (batch, nheads, dstate)
             dB = rearrange(dt, "b h d -> b h d 1") * rearrange(B, "b h n -> b h 1 n")  # (batch, nheads, dim, dstate)
-            mamba_cache_params.ssm_state[mamba_cache_params.state_indices_tensor].copy_(
-                state * dA + dB * rearrange(x, "b h d -> b h d 1"))  # (batch, dim, dstate
             out = torch.einsum("bhdn,bhn->bhd", state.to(C.dtype), C)
             if D is not None:
                 out += (x * D).to(out.dtype)
             hidden_states = out.view(batch, -1).to(x.dtype)
+            state_new = state * dA + dB * rearrange(x, "b h d -> b h d 1")
+            mamba_cache_params.ssm_state[mamba_cache_params.state_indices_tensor] = state_new.to(C.dtype)  # (batch, dim, dstate
 
 
         # 4. gated MLP
-        hidden_states = self.norm(hidden_states, gate)
+
+        save_tensor_sequentially(hidden_states, "before_norm", get_tensor_model_parallel_rank())
+        hidden_states = self.norm(hidden_states.unsqueeze(0), gate.unsqueeze(0)).squeeze(0)
+        save_tensor_sequentially(hidden_states, "after_norm", get_tensor_model_parallel_rank())
 
         # 5. Final linear projection
         out, _ = self.out_proj(hidden_states)
-        
+        save_tensor_sequentially(out, "after_proj", get_tensor_model_parallel_rank())
         return out
 
 
@@ -1037,14 +1187,14 @@ class Qwen3MoeMamba2Model(nn.Module):
         attn_metadata = get_forward_context().attn_metadata
         
         mamba2_metadata = None
-        # mamba2_metadata = prepare_mamba2_metadata(
-        #     chunk_size=256,
-        #     input_ids=input_ids,
-        #     attn_metadata=attn_metadata,
-        # )
+        mamba2_metadata = prepare_mamba2_metadata(
+            chunk_size=256,
+            attn_metadata=attn_metadata,
+        )
         mamba_index = 0
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
+            # print("layer {}".format(i))
             if isinstance(layer, AscendQwen3MoeDecoderLayer):
                 hidden_states, residual = layer(
                     positions=positions, 
@@ -1057,6 +1207,9 @@ class Qwen3MoeMamba2Model(nn.Module):
                     mamba_cache_params=mamba_cache_params.at_layer_idx(mamba_index),
                     mamba2_metadata=mamba2_metadata)
                 mamba_index += 1
+
+        if get_tensor_model_parallel_rank() == 1:
+            create_stop_flag()
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({

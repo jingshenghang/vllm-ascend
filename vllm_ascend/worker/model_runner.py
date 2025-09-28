@@ -1502,6 +1502,12 @@ class NPUModelRunner(NPUModelRunnerBase[ModelInputForNPUWithSamplingMetadata]):
                 logits=logits,
                 sampling_metadata=model_input.sampling_metadata,
             )
+            from vllm.distributed import (
+            divide, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank,
+            tensor_model_parallel_all_gather, tensor_model_parallel_all_reduce)
+            from vllm_ascend.models.qwen3_moe import save_tensor_sequentially
+            save_tensor_sequentially(logits, "logits", get_tensor_model_parallel_rank(), check_stop=False)
+            save_tensor_sequentially(torch.tensor([output.outputs[0].samples[0].output_token]), "sample", get_tensor_model_parallel_rank(), check_stop=False)
             if (self.observability_config is not None
                     and self.observability_config.collect_model_forward_time
                     and output is not None):
