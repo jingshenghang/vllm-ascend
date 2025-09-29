@@ -46,7 +46,8 @@ import re
 import torch
 
 # 全局配置变量 - 集中管理路径
-BASE_DIR = "/home/ascend-vllm/xxxxxxxxxx/mindspeed_vllm_tensor_align_0923"  # 基础目录
+DEFAULT_BASE_DIR = "/home/ascend-vllm/mindspeed_vllm_tensor_align_0923"  # 默认基础目录
+BASE_DIR = os.environ.get("VLLM_DEBUG_PATH", DEFAULT_BASE_DIR)  # 从环境变量获取，无则用默认
 FLAG_FILENAME = os.path.join(BASE_DIR, "vllm_donot_write.txt")  # 停止标志文件路径
 
 def check_stop_flag():
