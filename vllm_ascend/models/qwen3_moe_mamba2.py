@@ -407,8 +407,14 @@ def ssd_chunk_scan_combined(x, dt, A, B, C, chunk_size=256, D=None, z=None, dt_b
     dstate = B.shape[-1]
     if seqlen < chunk_size:
         chunk_size = seqlen
+    origin_seqlen = seqlen
     if seqlen % chunk_size != 0:
-        dt = F.pad(dt, (0, 0, 0, chunk_size - seqlen % chunk_size))
+        pad_len = chunk_size - seqlen % chunk_size
+        dt = F.pad(dt, (0, 0, 0, pad_len))
+        B = F.pad(B, (0, 0, 0, 0, 0, pad_len))
+        C = F.pad(C, (0, 0, 0, 0, 0, pad_len))
+        x = F.pad(x, (0, 0, 0, 0, 0, pad_len))
+        seqlen += pad_len
     dt = rearrange(dt, "b (c l) h -> b h c l", l=chunk_size)
     dt = dt.float()  # We want high precision for this before cumsum
     if dt_bias is not None:
@@ -430,6 +436,9 @@ def ssd_chunk_scan_combined(x, dt, A, B, C, chunk_size=256, D=None, z=None, dt_b
     final_states = final_states.to(states_dtype)
     # 3. Compute the output for each chunk
     out = chunk_scan(B, C, x, dt, dA_cumsum, states, D=D, z=z)
+    if origin_seqlen != seqlen:
+        out = out[:, :origin_seqlen]
+
     return out, final_states
 
 
@@ -1017,7 +1026,7 @@ class MambaMixer2Hybrid(nn.Module):
                 z=None,
                 dt_bias=self.dt_bias,
                 dt_softplus=True,
-                chunk_size=4096
+                chunk_size=256
             )
             # update ssm states
             mamba_cache_params.ssm_state[mamba_cache_params.state_indices_tensor] = states
