@@ -46,7 +46,7 @@ import re
 import torch
 
 # 全局配置变量 - 集中管理路径
-BASE_DIR = "/home/ascend-vllm/mindspeed_vllm_tensor_align_0923"  # 基础目录
+BASE_DIR = "/home/ascend-vllm/xxxxxxxxxx/mindspeed_vllm_tensor_align_0923"  # 基础目录
 FLAG_FILENAME = os.path.join(BASE_DIR, "vllm_donot_write.txt")  # 停止标志文件路径
 
 def check_stop_flag():
@@ -63,6 +63,12 @@ def check_stop_flag():
 
 
 def create_stop_flag():
+
+    debug_flag = os.environ.get('VLLM_IS_DEBUG', '0')
+    
+    # 仅当环境变量为'1'时执行逻辑
+    if debug_flag != '1':
+        return 0  # 非调试模式返回默认值0
     """
     创建或更新停止标志文件：
     - 不存在则创建并写入0
@@ -116,6 +122,12 @@ def save_tensor_sequentially(tensor, name, rank_id, check_stop=True):
     - rank_id: 张量的rank标识，用于区分同类型张量的不同rank
     - 返回值: 保存的文件名，若未保存则返回None
     """
+    
+    debug_flag = os.environ.get('VLLM_IS_DEBUG', '0')
+    
+    # 仅当环境变量为'1'时执行逻辑
+    if debug_flag != '1':
+        return 0  # 非调试模式返回默认值0
     # 检查停止标志
     if check_stop and check_stop_flag():
         # print(f"检测到 {FLAG_FILENAME}，已停止写入")
