@@ -41,6 +41,109 @@ from vllm.sequence import IntermediateTensors
 from vllm_ascend.ops.fused_moe import AscendSparseMoeBlock
 from vllm_ascend.ops.sequence_parallel import (MetadataForPadding,
                                                init_metadata_for_sp)
+import os
+import re
+import torch
+
+# 全局配置变量 - 集中管理路径
+DEFAULT_BASE_DIR = "/home/ascend-vllm/mindspeed_vllm_tensor_align_0923"  # 默认基础目录
+BASE_DIR = os.environ.get("VLLM_DEBUG_PATH", DEFAULT_BASE_DIR)  # 从环境变量获取，无则用默认
+FLAG_FILENAME = os.path.join(BASE_DIR, "vllm_donot_write.txt")  # 停止标志文件路径
+
+def check_stop_flag():
+    """检查是否需要停止写入：文件存在且内容为1时返回True"""
+    # 先检查文件是否存在
+    if not os.path.exists(FLAG_FILENAME):
+        return False
+    
+    # 读取文件内容并检查是否为1
+    with open(FLAG_FILENAME, 'r') as f:
+        content = f.read().strip()  # 去除空白字符和换行符
+    
+    return content == "1"
+
+
+def create_stop_flag():
+
+    debug_flag = os.environ.get('VLLM_IS_DEBUG', '0')
+    
+    # 仅当环境变量为'1'时执行逻辑
+    if debug_flag != '1':
+        return 0  # 非调试模式返回默认值0
+    """
+    创建或更新停止标志文件：
+    - 不存在则创建并写入0
+    - 存在且内容为0则更新为1
+    - 存在且内容为1则不做操作
+    """
+    if os.path.exists(FLAG_FILENAME):
+        # 文件存在，读取当前内容
+        with open(FLAG_FILENAME, 'r') as f:
+            content = f.read().strip()
+        
+        # 只有内容为0时才更新为1
+        if content == "0":
+            with open(FLAG_FILENAME, 'w') as f:
+                f.write("1")
+    else:
+        # 文件不存在，创建并写入0
+        with open(FLAG_FILENAME, 'w') as f:
+            f.write("0")
+
+def find_latest_sequence_number(name, rank_id):
+    """
+    查找当前文件夹中指定name和rank_id的最大序号
+    name: 张量名称标识
+    rank_id: 张量的rank标识
+    """
+    # 正则匹配 "vllm_{name}_rank_{rank_id}_数字.pt" 格式
+    # 使用re.escape处理特殊字符，确保匹配准确性
+    pattern = re.compile(
+        f"^vllm_{re.escape(name)}_rank_{re.escape(str(rank_id))}_(\d+)\.pt$"
+    )
+    max_num = 0
+    
+    # 遍历基础目录下的所有文件
+    for filename in os.listdir(BASE_DIR):
+        file_path = os.path.join(BASE_DIR, filename)
+        if os.path.isfile(file_path):
+            match = pattern.match(filename)
+            if match:
+                num = int(match.group(1))
+                if num > max_num:
+                    max_num = num
+    return max_num
+
+
+def save_tensor_sequentially(tensor, name, rank_id, check_stop=True):
+    """
+    按name和rank_id分别递增保存张量，带停止标志检查
+    - 若存在停止标志文件则停止写入
+    - name: 张量名称，用于区分不同类型的张量
+    - rank_id: 张量的rank标识，用于区分同类型张量的不同rank
+    - 返回值: 保存的文件名，若未保存则返回None
+    """
+    
+    debug_flag = os.environ.get('VLLM_IS_DEBUG', '0')
+    
+    # 仅当环境变量为'1'时执行逻辑
+    if debug_flag != '1':
+        return 0  # 非调试模式返回默认值0
+    # 检查停止标志
+    if check_stop and check_stop_flag():
+        # print(f"检测到 {FLAG_FILENAME}，已停止写入")
+        return None
+    
+    # 获取当前name和rank_id组合的最大序号并计算下一个序号
+    latest_num = find_latest_sequence_number(name, rank_id)
+    next_num = latest_num + 1
+    
+    # 生成新文件名并保存（格式：vllm_{name}_rank_{rank_id}_{num}.pt）
+    new_filename = os.path.join(BASE_DIR, f"vllm_{name}_rank_{rank_id}_{next_num}.pt")
+    torch.save(tensor.cpu(), new_filename)
+    # print(f"已保存文件: {new_filename}")
+    
+    return new_filename
 
 
 class AscendQwen3MoeDecoderLayer(nn.Module):
@@ -128,6 +231,12 @@ class AscendQwen3MoeDecoderLayer(nn.Module):
                 hidden_states = _metadata_for_padding.allgather_unpadding_aligned(
                     hidden_states)
 
+        from vllm.distributed import (
+            divide, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank,
+            tensor_model_parallel_all_gather, tensor_model_parallel_all_reduce)
+
+        save_tensor_sequentially(hidden_states, "before_attn", get_tensor_model_parallel_rank())
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -141,6 +250,7 @@ class AscendQwen3MoeDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
 
+        save_tensor_sequentially(hidden_states, "before_mlp", get_tensor_model_parallel_rank())
         hidden_states = self.mlp(hidden_states,
                                  _metadata_for_padding=_metadata_for_padding)
 
